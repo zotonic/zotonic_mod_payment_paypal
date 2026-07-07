@@ -1,0 +1,18 @@
+{application, zotonic_mod_payment_paypal, [
+    {description, "Zotonic module for processing payments using PayPal as a Payment Service Provider."},
+    {vsn, git},
+    {registered, []},
+    {applications, [
+        kernel, stdlib,
+        inets, ssl,
+        zotonic_core
+    ]},
+    {env, []},
+    {modules, []},
+    {doc, "doc"},
+    {licenses, ["Apache-2.0"]},
+    {links, [
+        {"Website", "http://zotonic.com/"},
+        {"GitHub", "https://github.com/zotonic/zotonic_mod_payment_paypal"}
+    ]}
+]}.

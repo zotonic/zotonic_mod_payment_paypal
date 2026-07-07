@@ -1,0 +1,4 @@
+[
+    {paypal_payment_webhook, [ "paypal", "webhook" ], controller_paypal_webhook, []},
+    {paypal_payment_redirect, [ "paypal", "ready", payment_nr ], controller_paypal_redirect, []}
+].
