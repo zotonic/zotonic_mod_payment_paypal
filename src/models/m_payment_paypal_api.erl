@@ -482,20 +482,6 @@ paypal_name_props(Payer) ->
             #{}
     end.
 
-% paypal_full_name_props(Name) when is_binary(Name) ->
-%     case binary:split(z_string:trim(Name), <<" ">>, [global, trim_all]) of
-%         [] ->
-%             #{};
-%         [<<>>] ->
-%             #{};
-%         [Surname] ->
-%             #{ <<"name_surname">> => Surname };
-%         [First | Rest] ->
-%             #{ <<"name_first">> => First,
-%                <<"name_surname">> => iolist_to_binary(lists:join(<<" ">>, Rest)) }
-%     end;
-% paypal_full_name_props(_) ->
-%     #{}.
 
 paypal_address_props(Address) when is_map(Address) ->
     #{
