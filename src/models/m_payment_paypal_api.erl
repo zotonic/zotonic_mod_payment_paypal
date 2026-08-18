@@ -608,6 +608,8 @@ is_valid_order_id(OrderId)
 is_valid_order_id(_OrderId) ->
     false.
 
+is_valid_order_id_1(<<>>) ->
+    true;
 is_valid_order_id_1(<<C, T/binary>>)
     when
         (C >= $A andalso C =< $Z) orelse
