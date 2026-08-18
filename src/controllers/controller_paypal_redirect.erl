@@ -43,17 +43,17 @@ moved_temporarily(Context) ->
     case z_context:get_q(<<"status">>, Context) of
         <<"ok">> ->
             case m_payment_paypal_api:capture_order(OrderId, Context) of
-                {ok, {CapturedPaymentNr, Status}} ->
-                    redirect(disp(Status), CapturedPaymentNr, Context);
+                {ok, {CapturedPaymentNr, _Status}} ->
+                    redirect(CapturedPaymentNr, Context);
                 {error, _} ->
-                    redirect(payment_psp_cancel, PaymentNr, Context)
+                    redirect(PaymentNr, Context)
             end;
         <<"cancel">> ->
-            case m_payment_paypal_api:cancel_order(PaymentNr, Context) of
-                {ok, {CancelledPaymentNr, Status}} ->
-                    redirect(disp(Status), CancelledPaymentNr, Context);
+            case m_payment_paypal_api:sync_order_status(OrderId, Context) of
+                {ok, {SyncedPaymentNr, _Status}} ->
+                    redirect(SyncedPaymentNr, Context);
                 {error, _} ->
-                    redirect(payment_psp_cancel, PaymentNr, Context)
+                    redirect(PaymentNr, Context)
             end;
         Status ->
             ?LOG_WARNING(#{
@@ -61,20 +61,15 @@ moved_temporarily(Context) ->
                 text => <<"PayPal redirect with unknown status">>,
                 result => error,
                 reason => unknown_status,
+                payment_nr => PaymentNr,
                 status => Status
             }),
-            redirect(payment_psp_cancel, PaymentNr, Context)
+            redirect(PaymentNr, Context)
     end.
 
-disp(cancelled) -> payment_psp_cancel;
-disp(failed) -> payment_psp_cancel;
-disp(paid) -> payment_psp_done;
-disp(pending) -> payment_psp_done;
-disp(new) -> payment_psp_done.
-
-redirect(Dispatch, PaymentNr, Context) ->
+redirect(PaymentNr, Context) ->
     Args = [
         {payment_nr, PaymentNr}
     ],
-    Location = z_context:abs_url(z_dispatcher:url_for(Dispatch, Args, Context), Context),
+    Location = z_context:abs_url(z_dispatcher:url_for(payment_psp_done, Args, Context), Context),
     {{true, Location}, Context}.

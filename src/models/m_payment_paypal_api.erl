@@ -23,7 +23,7 @@
 
     payment_url/2,
 
-    cancel_order/2,
+    mark_order_cancelled/2,
     capture_order/2,
     sync_order_status/2,
 
@@ -44,6 +44,12 @@
 
 -define(TIMEOUT_REQUEST, 10000).
 -define(TIMEOUT_CONNECT, 5000).
+
+
+% Per https://developer.paypal.com/serversdk/java/api-endpoints/orders/get-order/ is the
+% order id size between 1 and 36 chars, inclusive.  Accept a bit more to be future proof.
+-define(MAX_ORDERID_SIZE, 40).
+-define(MIN_ORDERID_SIZE, 1).
 
 %% @doc Check if the configured PayPal credentials can fetch an OAuth token.
 -spec ping(Context) -> ok | {error, term()}
@@ -244,13 +250,13 @@ approve_urls(Rel, Links) ->
         Links).
 
 %% @doc Mark a locally cancelled order as cancelled.
--spec cancel_order(PaymentNr, Context) -> {ok, {PaymentNr, Status}} | {error, term()}
+-spec mark_order_cancelled(PaymentNr, Context) -> {ok, {PaymentNr, Status}} | {error, term()}
     when PaymentNr :: binary() | undefined,
          Context :: z:context(),
          Status :: cancelled.
-cancel_order(undefined, _Context) ->
+mark_order_cancelled(undefined, _Context) ->
     {error, payment_nr};
-cancel_order(PaymentNr, Context) ->
+mark_order_cancelled(PaymentNr, Context) ->
     case set_payment_status(PaymentNr, cancelled, calendar:universal_time(), #{}, Context) of
         {ok, {PaymentNr, cancelled}} = OK -> OK;
         {error, _} = Error -> Error
@@ -265,12 +271,18 @@ cancel_order(PaymentNr, Context) ->
 capture_order(undefined, _Context) ->
     {error, order_id};
 capture_order(OrderId, Context) ->
-    Endpoint = "/v2/checkout/orders/" ++ binary_to_list(OrderId) ++ "/capture",
-    case api_call(post, Endpoint, #{}, Context) of
-        {ok, Capture} ->
-            sync_order_status_1(Capture, Context);
-        {error, _} = Error ->
-            Error
+    case is_valid_order_id(OrderId) of
+        true ->
+            OrderId1 = z_convert:to_list(z_url:url_encode(OrderId)),
+            Endpoint = "/v2/checkout/orders/" ++ OrderId1 ++ "/capture",
+            case api_call(post, Endpoint, #{}, Context) of
+                {ok, Capture} ->
+                    sync_order_status_1(Capture, Context);
+                {error, _} = Error ->
+                    Error
+            end;
+        false ->
+            {error, order_id}
     end.
 
 %% @doc Set the local status from an order map or an order id.
@@ -370,8 +382,14 @@ set_payment_status(PaymentNr, Status, DT, Order, Context) ->
 
 %% @doc Retrieve an order from PayPal.
 fetch_order(OrderId, Context) ->
-    Url = "/v2/checkout/orders/" ++ binary_to_list(OrderId),
-    api_call(get, Url, undefined, Context).
+    case is_valid_order_id(OrderId) of
+        true ->
+            OrderId1 = z_convert:to_list(z_url:url_encode(OrderId)),
+            Url = "/v2/checkout/orders/" ++ OrderId1,
+            api_call(get, Url, undefined, Context);
+        false ->
+            {error, order_id}
+    end.
 
 maybe_update_contact(_PaymentId, _Order, _CurrentStatus, new, _Context) ->
     ok;
@@ -464,20 +482,20 @@ paypal_name_props(Payer) ->
             #{}
     end.
 
-paypal_full_name_props(Name) when is_binary(Name) ->
-    case binary:split(z_string:trim(Name), <<" ">>, [global, trim_all]) of
-        [] ->
-            #{};
-        [<<>>] ->
-            #{};
-        [Surname] ->
-            #{ <<"name_surname">> => Surname };
-        [First | Rest] ->
-            #{ <<"name_first">> => First,
-               <<"name_surname">> => iolist_to_binary(lists:join(<<" ">>, Rest)) }
-    end;
-paypal_full_name_props(_) ->
-    #{}.
+% paypal_full_name_props(Name) when is_binary(Name) ->
+%     case binary:split(z_string:trim(Name), <<" ">>, [global, trim_all]) of
+%         [] ->
+%             #{};
+%         [<<>>] ->
+%             #{};
+%         [Surname] ->
+%             #{ <<"name_surname">> => Surname };
+%         [First | Rest] ->
+%             #{ <<"name_first">> => First,
+%                <<"name_surname">> => iolist_to_binary(lists:join(<<" ">>, Rest)) }
+%     end;
+% paypal_full_name_props(_) ->
+%     #{}.
 
 paypal_address_props(Address) when is_map(Address) ->
     #{
@@ -592,6 +610,26 @@ capture_order_id(#{ <<"supplementary_data">> := #{ <<"related_ids">> := #{ <<"or
     OrderId;
 capture_order_id(_) ->
     undefined.
+
+%% @doc Paypal order ids are in the format: ^[A-Z0-9]+$ and have a length of 1..36 characters.
+%% Also accept lowercase a-z and a bit more characters, just to be future proof.
+is_valid_order_id(OrderId)
+    when
+        is_binary(OrderId),
+        size(OrderId) =< ?MAX_ORDERID_SIZE,
+        size(OrderId) >= ?MIN_ORDERID_SIZE ->
+    is_valid_order_id_1(OrderId);
+is_valid_order_id(_OrderId) ->
+    false.
+
+is_valid_order_id_1(<<C, T/binary>>)
+    when
+        (C >= $A andalso C =< $Z) orelse
+        (C >= $a andalso C =< $z) orelse
+        (C >= $0 andalso C =< $9) ->
+    is_valid_order_id_1(T);
+is_valid_order_id_1(_) ->
+    false.
 
 is_valid_webhook_signature(Event, Context) ->
     case webhook_id(Context) of
