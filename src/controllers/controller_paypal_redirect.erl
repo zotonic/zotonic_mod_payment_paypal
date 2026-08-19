@@ -106,16 +106,28 @@ handle_signed_cancel(PaymentNr, OrderId, Context) ->
             <<"psp_module">> := mod_payment_paypal,
             <<"psp_external_id">> := OrderId
         }} when is_binary(OrderId), OrderId =/= <<>> ->
-            case m_payment_paypal_api:mark_order_cancelled(PaymentNr, Context) of
-                {ok, {PaymentNr, cancelled}} ->
+            case m_payment_paypal_api:cancel_payment(PaymentNr, OrderId, Context) of
+                {ok, cancelled, {PaymentNr, cancelled}, PaypalStatus} ->
                     ?LOG_INFO(#{
                         in => zotonic_mod_payment_paypal,
-                        text => <<"PayPal payment set to cancelled after valid signed cancel state">>,
+                        text => <<"PayPal payment set to cancelled after checking the PayPal order status">>,
                         result => ok,
                         reason => paypal_cancel_redirect,
                         payment_nr => PaymentNr,
                         paypal_order_id => OrderId,
+                        paypal_status => PaypalStatus,
                         status => cancelled
+                    });
+                {ok, synchronized, {PaymentNr, Status}, PaypalStatus} ->
+                    ?LOG_WARNING(#{
+                        in => zotonic_mod_payment_paypal,
+                        text => <<"PayPal cancel redirect did not cancel an order in a non-cancelable PayPal state">>,
+                        result => ok,
+                        reason => paypal_order_not_cancelable,
+                        payment_nr => PaymentNr,
+                        paypal_order_id => OrderId,
+                        paypal_status => PaypalStatus,
+                        status => Status
                     });
                 {error, {status, Status}} ->
                     ?LOG_WARNING(#{

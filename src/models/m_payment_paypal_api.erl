@@ -23,6 +23,7 @@
 
     payment_url/2,
 
+    cancel_payment/3,
     mark_order_cancelled/2,
     capture_order/2,
     sync_order_status/2,
@@ -259,6 +260,69 @@ approve_urls(Rel, Links) ->
                 false
         end,
         Links).
+
+%% @doc Cancel a local payment only if its PayPal order is still open.
+%% Non-cancelable PayPal states are authoritative and are synchronized instead.
+-spec cancel_payment(PaymentNr, OrderId, Context) -> Result
+    when PaymentNr :: binary() | undefined,
+         OrderId :: binary() | undefined,
+         Context :: z:context(),
+         LocalStatus :: new | pending | paid | cancelled | failed,
+         PaypalStatus :: binary(),
+         Result ::
+             {ok, cancelled, {PaymentNr, cancelled}, PaypalStatus}
+             | {ok, synchronized, {PaymentNr, LocalStatus}, PaypalStatus}
+             | {error, term()}.
+cancel_payment(undefined, _OrderId, _Context) ->
+    {error, payment_nr};
+cancel_payment(_PaymentNr, undefined, _Context) ->
+    {error, order_id};
+cancel_payment(PaymentNr, OrderId, Context) ->
+    case fetch_order(OrderId, Context) of
+        {ok, Order} ->
+            cancel_payment_1(PaymentNr, OrderId, Order, Context);
+        {error, _} = Error ->
+            Error
+    end.
+
+cancel_payment_1(PaymentNr, OrderId, Order, Context) ->
+    PaypalPaymentNr = payment_nr(Order),
+    PaypalStatus = maps:get(<<"status">>, Order, undefined),
+    case PaypalPaymentNr of
+        PaymentNr ->
+            case is_cancelable_order_status(PaypalStatus) of
+                true ->
+                    case mark_order_cancelled(PaymentNr, Context) of
+                        {ok, Result} ->
+                            {ok, cancelled, Result, PaypalStatus};
+                        {error, _} = Error ->
+                            Error
+                    end;
+                false ->
+                    case sync_order_status_1(Order, Context) of
+                        {ok, Result} ->
+                            {ok, synchronized, Result, PaypalStatus};
+                        {error, _} = Error ->
+                            Error
+                    end
+            end;
+        _ ->
+            ?LOG_WARNING(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"PayPal cancel order does not match the local payment">>,
+                result => error,
+                reason => payment_nr_mismatch,
+                payment_nr => PaymentNr,
+                paypal_payment_nr => PaypalPaymentNr,
+                paypal_order_id => OrderId
+            }),
+            {error, payment_nr}
+    end.
+
+is_cancelable_order_status(<<"CREATED">>) -> true;
+is_cancelable_order_status(<<"SAVED">>) -> true;
+is_cancelable_order_status(<<"PAYER_ACTION_REQUIRED">>) -> true;
+is_cancelable_order_status(_) -> false.
 
 %% @doc Mark a locally cancelled order as cancelled.
 -spec mark_order_cancelled(PaymentNr, Context) -> {ok, {PaymentNr, Status}} | {error, term()}
