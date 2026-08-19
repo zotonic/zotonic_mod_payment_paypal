@@ -113,11 +113,14 @@ observe_payment_psp_status_sync(#payment_psp_status_sync{}, _Context) ->
         Result :: ok | {error, term()}.
 cancel_missing_open_payment(PaymentId, OrderId, Error, Context) ->
     case m_payment:get(PaymentId, Context) of
-        {ok, #{ <<"status">> := Status }}
-            when Status =:= <<"new">>;
-                 Status =:= <<"pending">> ->
-            case mod_payment:set_payment_status(PaymentId, cancelled, Context) of
-                ok ->
+        {ok, #{
+            <<"payment_nr">> := PaymentNr,
+            <<"status">> := Status
+        }}
+            when Status =:= new;
+                 Status =:= pending ->
+            case m_payment_paypal_api:mark_order_cancelled(PaymentNr, Context) of
+                {ok, {PaymentNr, cancelled}} ->
                     ?LOG_WARNING(#{
                         in => zotonic_mod_payment_paypal,
                         text => <<"PayPal payment set to cancelled because the order could not be found">>,
@@ -129,8 +132,8 @@ cancel_missing_open_payment(PaymentId, OrderId, Error, Context) ->
                         status => cancelled
                     }),
                     ok;
-                {error, _} = SetError ->
-                    SetError
+                {error, _} = CancelError ->
+                    CancelError
             end;
         {ok, _Payment} ->
             Error;

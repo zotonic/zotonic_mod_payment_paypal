@@ -37,7 +37,7 @@ previously_existed(Context) ->
     {true, Context}.
 
 moved_temporarily(Context) ->
-    % Args: token / status=cancel|ok / payment_nr
+    % Args: token / status=cancel|ok / payment_nr / state
     PaymentNr = z_context:get_q(<<"payment_nr">>, Context),
     OrderId = z_context:get_q(<<"token">>, Context),
     case z_context:get_q(<<"status">>, Context) of
@@ -49,12 +49,7 @@ moved_temporarily(Context) ->
                     redirect(PaymentNr, Context)
             end;
         <<"cancel">> ->
-            case m_payment_paypal_api:sync_order_status(OrderId, Context) of
-                {ok, {SyncedPaymentNr, _Status}} ->
-                    redirect(SyncedPaymentNr, Context);
-                {error, _} ->
-                    redirect(PaymentNr, Context)
-            end;
+            handle_cancel(PaymentNr, OrderId, Context);
         Status ->
             ?LOG_WARNING(#{
                 in => zotonic_mod_payment_paypal,
@@ -64,6 +59,113 @@ moved_temporarily(Context) ->
                 payment_nr => PaymentNr,
                 status => Status
             }),
+            redirect(PaymentNr, Context)
+    end.
+
+%% PayPal's browser redirect is not signed and the Referer header is optional.
+%% Authenticate the callback using our own signed, expiring state instead.
+handle_cancel(PaymentNr, OrderId, Context) ->
+    State = z_context:get_q(<<"state">>, Context),
+    case decode_cancel_state(State, Context) of
+        {ok, SignedPaymentNr} ->
+            handle_signed_cancel(SignedPaymentNr, OrderId, Context);
+        {error, Reason} ->
+            ?LOG_WARNING(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"PayPal cancel redirect with invalid signed state">>,
+                result => error,
+                reason => Reason,
+                payment_nr => PaymentNr
+            }),
+            sync_cancel_order(PaymentNr, OrderId, Context)
+    end.
+
+-spec decode_cancel_state(State, Context) -> Result
+    when
+        State :: binary() | undefined,
+        Context :: z:context(),
+        Result :: {ok, binary()} | {error, missing | expired | invalid}.
+decode_cancel_state(undefined, _Context) ->
+    {error, missing};
+decode_cancel_state(State, Context) when is_binary(State) ->
+    try z_crypto:decode_value_expire(State, Context) of
+        {ok, {paypal_cancel, PaymentNr}} when is_binary(PaymentNr), PaymentNr =/= <<>> ->
+            {ok, PaymentNr};
+        {error, expired} ->
+            {error, expired};
+        _Other ->
+            {error, invalid}
+    catch
+        _:_ ->
+            {error, invalid}
+    end.
+
+handle_signed_cancel(PaymentNr, OrderId, Context) ->
+    case m_payment:get(PaymentNr, Context) of
+        {ok, #{
+            <<"psp_module">> := mod_payment_paypal,
+            <<"psp_external_id">> := OrderId
+        }} when is_binary(OrderId), OrderId =/= <<>> ->
+            case m_payment_paypal_api:mark_order_cancelled(PaymentNr, Context) of
+                {ok, {PaymentNr, cancelled}} ->
+                    ?LOG_INFO(#{
+                        in => zotonic_mod_payment_paypal,
+                        text => <<"PayPal payment set to cancelled after valid signed cancel state">>,
+                        result => ok,
+                        reason => paypal_cancel_redirect,
+                        payment_nr => PaymentNr,
+                        paypal_order_id => OrderId,
+                        status => cancelled
+                    });
+                {error, {status, Status}} ->
+                    ?LOG_WARNING(#{
+                        in => zotonic_mod_payment_paypal,
+                        text => <<"PayPal cancel redirect ignored for finalized payment">>,
+                        result => error,
+                        reason => finalized,
+                        payment_nr => PaymentNr,
+                        paypal_order_id => OrderId,
+                        status => Status
+                    });
+                {error, Reason} ->
+                    ?LOG_ERROR(#{
+                        in => zotonic_mod_payment_paypal,
+                        text => <<"Could not cancel payment after valid signed PayPal cancel state">>,
+                        result => error,
+                        reason => Reason,
+                        payment_nr => PaymentNr,
+                        paypal_order_id => OrderId
+                    })
+            end,
+            redirect(PaymentNr, Context);
+        {ok, Payment} ->
+            ?LOG_WARNING(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"PayPal cancel redirect does not match the local payment order">>,
+                result => error,
+                reason => order_mismatch,
+                payment_nr => PaymentNr,
+                paypal_order_id => OrderId,
+                expected_paypal_order_id => maps:get(<<"psp_external_id">>, Payment, undefined)
+            }),
+            redirect(PaymentNr, Context);
+        {error, Reason} ->
+            ?LOG_WARNING(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"PayPal cancel redirect for unknown local payment">>,
+                result => error,
+                reason => Reason,
+                payment_nr => PaymentNr,
+                paypal_order_id => OrderId
+            }),
+            redirect(PaymentNr, Context)
+    end.
+
+sync_cancel_order(PaymentNr, OrderId, Context) ->
+    case m_payment_paypal_api:sync_order_status(OrderId, Context) of
+        {ok, {SyncedPaymentNr, _Status}} ->
+            redirect(SyncedPaymentNr, Context);
+        {error, _} ->
             redirect(PaymentNr, Context)
     end.
 

@@ -44,6 +44,7 @@
 
 -define(TIMEOUT_REQUEST, 10000).
 -define(TIMEOUT_CONNECT, 5000).
+-define(CANCEL_STATE_EXPIRY_HOURS, 72).
 
 
 % Per https://developer.paypal.com/serversdk/java/api-endpoints/orders/get-order/ is the
@@ -147,6 +148,10 @@ order_payload(Payment, Context) ->
     Currency = maps:get(<<"currency">>, Payment),
     Amount = maps:get(<<"amount">>, Payment),
     PaymentNr = maps:get(<<"payment_nr">>, Payment),
+    CancelState = z_crypto:encode_value_expire(
+        {paypal_cancel, PaymentNr},
+        z_datetime:next_hour(calendar:universal_time(), ?CANCEL_STATE_EXPIRY_HOURS),
+        Context),
     SuccessUrl = z_context:abs_url(
         z_dispatcher:url_for(
             paypal_payment_redirect,
@@ -156,7 +161,11 @@ order_payload(Payment, Context) ->
     CancelUrl = z_context:abs_url(
         z_dispatcher:url_for(
             paypal_payment_redirect,
-            [ {payment_nr, PaymentNr}, {status, "cancel"} ],
+            [
+                {payment_nr, PaymentNr},
+                {status, "cancel"},
+                {state, CancelState}
+            ],
             Context),
         Context),
     #{
@@ -257,10 +266,28 @@ approve_urls(Rel, Links) ->
 mark_order_cancelled(undefined, _Context) ->
     {error, payment_nr};
 mark_order_cancelled(PaymentNr, Context) ->
-    case set_payment_status(PaymentNr, cancelled, calendar:universal_time(), #{}, Context) of
-        {ok, {PaymentNr, cancelled}} = OK -> OK;
-        {error, _} = Error -> Error
-    end.
+    z_db:transaction(
+        fun(Ctx) ->
+            case z_db:qmap_row(
+                "select status from payment where payment_nr = $1 for update",
+                [PaymentNr],
+                Ctx)
+            of
+                {ok, #{ <<"status">> := Status }}
+                    when Status =:= <<"new">>;
+                         Status =:= <<"pending">> ->
+                    set_payment_status(PaymentNr, cancelled, calendar:universal_time(), #{}, Ctx);
+                {ok, #{ <<"status">> := <<"cancelled">> }} ->
+                    {ok, {PaymentNr, cancelled}};
+                {ok, #{ <<"status">> := Status }} ->
+                    {error, {status, z_convert:to_atom(Status)}};
+                {error, enoent} ->
+                    {error, notfound};
+                {error, _} = Error ->
+                    Error
+            end
+        end,
+        Context).
 
 %% @doc Capture an approved PayPal order and sync the resulting local status.
 -spec capture_order(OrderId, Context) -> {ok, {PaymentNr, Status}} | {error, term()}
