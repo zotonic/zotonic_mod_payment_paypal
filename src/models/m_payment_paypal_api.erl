@@ -268,7 +268,7 @@ approve_urls(Rel, Links) ->
          OrderId :: binary() | undefined,
          Context :: z:context(),
          LocalStatus :: new | pending | paid | cancelled | failed | refunded | error,
-         PaypalStatus :: binary(),
+         PaypalStatus :: binary() | undefined,
          Result ::
              {ok, cancelled, {PaymentNr, cancelled}, PaypalStatus}
              | {ok, synchronized, {PaymentNr, LocalStatus}, PaypalStatus}
@@ -360,7 +360,7 @@ mark_order_cancelled(PaymentNr, Context) ->
     when OrderId :: binary() | undefined,
          Context :: z:context(),
          PaymentNr :: binary(),
-         Status :: pending | paid | failed.
+         Status :: new | pending | paid | cancelled | failed | refunded | error.
 capture_order(undefined, _Context) ->
     {error, order_id};
 capture_order(OrderId, Context) ->
@@ -387,7 +387,7 @@ capture_order_locked(OrderId, Context) ->
         Context)
     of
         {ok, #{
-            <<"payment_nr">> := PaymentNr,
+            <<"payment_nr">> := _PaymentNr,
             <<"status">> := Status
         }}
             when Status =:= <<"new">>;
