@@ -23,7 +23,8 @@
 
     payment_url/2,
 
-    cancel_order/2,
+    cancel_payment/3,
+    mark_order_cancelled/2,
     capture_order/2,
     sync_order_status/2,
 
@@ -44,6 +45,13 @@
 
 -define(TIMEOUT_REQUEST, 10000).
 -define(TIMEOUT_CONNECT, 5000).
+-define(CANCEL_STATE_EXPIRY_HOURS, 72).
+
+
+% Per https://developer.paypal.com/serversdk/java/api-endpoints/orders/get-order/ is the
+% order id size between 1 and 36 chars, inclusive.  Accept a bit more to be future proof.
+-define(MAX_ORDERID_SIZE, 40).
+-define(MIN_ORDERID_SIZE, 1).
 
 %% @doc Check if the configured PayPal credentials can fetch an OAuth token.
 -spec ping(Context) -> ok | {error, term()}
@@ -141,16 +149,26 @@ order_payload(Payment, Context) ->
     Currency = maps:get(<<"currency">>, Payment),
     Amount = maps:get(<<"amount">>, Payment),
     PaymentNr = maps:get(<<"payment_nr">>, Payment),
+    CancelState = z_crypto:encode_value_expire(
+        {paypal_cancel, PaymentNr},
+        z_datetime:next_hour(calendar:universal_time(), ?CANCEL_STATE_EXPIRY_HOURS),
+        Context),
     SuccessUrl = z_context:abs_url(
         z_dispatcher:url_for(
             paypal_payment_redirect,
             [ {payment_nr, PaymentNr}, {status, "ok"} ],
+            none,
             Context),
         Context),
     CancelUrl = z_context:abs_url(
         z_dispatcher:url_for(
             paypal_payment_redirect,
-            [ {payment_nr, PaymentNr}, {status, "cancel"} ],
+            [
+                {payment_nr, PaymentNr},
+                {status, "cancel"},
+                {state, CancelState}
+            ],
+            none,
             Context),
         Context),
     #{
@@ -243,32 +261,166 @@ approve_urls(Rel, Links) ->
         end,
         Links).
 
+%% @doc Cancel a local payment only if its PayPal order is still open.
+%% Non-cancelable PayPal states are authoritative and are synchronized instead.
+-spec cancel_payment(PaymentNr, OrderId, Context) -> Result
+    when PaymentNr :: binary() | undefined,
+         OrderId :: binary() | undefined,
+         Context :: z:context(),
+         LocalStatus :: new | pending | paid | cancelled | failed | refunded | error,
+         PaypalStatus :: binary() | undefined,
+         Result ::
+             {ok, cancelled, {PaymentNr, cancelled}, PaypalStatus}
+             | {ok, synchronized, {PaymentNr, LocalStatus}, PaypalStatus}
+             | {error, term()}.
+cancel_payment(undefined, _OrderId, _Context) ->
+    {error, payment_nr};
+cancel_payment(_PaymentNr, undefined, _Context) ->
+    {error, order_id};
+cancel_payment(PaymentNr, OrderId, Context) ->
+    case fetch_order(OrderId, Context) of
+        {ok, Order} ->
+            cancel_payment_1(PaymentNr, OrderId, Order, Context);
+        {error, _} = Error ->
+            Error
+    end.
+
+cancel_payment_1(PaymentNr, OrderId, Order, Context) ->
+    PaypalPaymentNr = payment_nr(Order),
+    PaypalStatus = maps:get(<<"status">>, Order, undefined),
+    case PaypalPaymentNr of
+        PaymentNr ->
+            case is_cancelable_order_status(PaypalStatus) of
+                true ->
+                    case mark_order_cancelled(PaymentNr, Context) of
+                        {ok, Result} ->
+                            {ok, cancelled, Result, PaypalStatus};
+                        {error, _} = Error ->
+                            Error
+                    end;
+                false ->
+                    case sync_order_status_1(Order, Context) of
+                        {ok, Result} ->
+                            {ok, synchronized, Result, PaypalStatus};
+                        {error, _} = Error ->
+                            Error
+                    end
+            end;
+        _ ->
+            ?LOG_WARNING(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"PayPal cancel order does not match the local payment">>,
+                result => error,
+                reason => payment_nr_mismatch,
+                payment_nr => PaymentNr,
+                paypal_payment_nr => PaypalPaymentNr,
+                paypal_order_id => OrderId
+            }),
+            {error, payment_nr}
+    end.
+
+is_cancelable_order_status(<<"CREATED">>) -> true;
+is_cancelable_order_status(<<"SAVED">>) -> true;
+is_cancelable_order_status(<<"PAYER_ACTION_REQUIRED">>) -> true;
+is_cancelable_order_status(_) -> false.
+
 %% @doc Mark a locally cancelled order as cancelled.
--spec cancel_order(PaymentNr, Context) -> {ok, {PaymentNr, Status}} | {error, term()}
+-spec mark_order_cancelled(PaymentNr, Context) -> {ok, {PaymentNr, Status}} | {error, term()}
     when PaymentNr :: binary() | undefined,
          Context :: z:context(),
          Status :: cancelled.
-cancel_order(undefined, _Context) ->
+mark_order_cancelled(undefined, _Context) ->
     {error, payment_nr};
-cancel_order(PaymentNr, Context) ->
-    case set_payment_status(PaymentNr, cancelled, calendar:universal_time(), #{}, Context) of
-        {ok, {PaymentNr, cancelled}} = OK -> OK;
-        {error, _} = Error -> Error
-    end.
+mark_order_cancelled(PaymentNr, Context) ->
+    z_db:transaction(
+        fun(Ctx) ->
+            case z_db:qmap_row(
+                "select status from payment where payment_nr = $1 for update",
+                [PaymentNr],
+                Ctx)
+            of
+                {ok, #{ <<"status">> := Status }}
+                    when Status =:= <<"new">>;
+                         Status =:= <<"pending">> ->
+                    set_payment_status(PaymentNr, cancelled, calendar:universal_time(), #{}, Ctx);
+                {ok, #{ <<"status">> := <<"cancelled">> }} ->
+                    {ok, {PaymentNr, cancelled}};
+                {ok, #{ <<"status">> := Status }} ->
+                    {error, {status, z_convert:to_atom(Status)}};
+                {error, enoent} ->
+                    {error, notfound};
+                {error, _} = Error ->
+                    Error
+            end
+        end,
+        Context).
 
 %% @doc Capture an approved PayPal order and sync the resulting local status.
 -spec capture_order(OrderId, Context) -> {ok, {PaymentNr, Status}} | {error, term()}
     when OrderId :: binary() | undefined,
          Context :: z:context(),
          PaymentNr :: binary(),
-         Status :: pending | paid | failed.
+         Status :: new | pending | paid | cancelled | failed | refunded | error.
 capture_order(undefined, _Context) ->
     {error, order_id};
 capture_order(OrderId, Context) ->
-    Endpoint = "/v2/checkout/orders/" ++ binary_to_list(OrderId) ++ "/capture",
-    case api_call(post, Endpoint, #{}, Context) of
-        {ok, Capture} ->
-            sync_order_status_1(Capture, Context);
+    case is_valid_order_id(OrderId) of
+        true ->
+            % PayPal has no cancel operation for CAPTURE orders. Keep the
+            % payment row locked while capturing, so a terminal local status
+            % is also an effective merchant-side closure of the PayPal order.
+            z_db:transaction(
+                fun(Ctx) -> capture_order_locked(OrderId, Ctx) end,
+                Context);
+        false ->
+            {error, order_id}
+    end.
+
+capture_order_locked(OrderId, Context) ->
+    case z_db:qmap_row(
+        "select payment_nr, status
+         from payment
+         where psp_module = $1
+           and psp_external_id = $2
+         for update",
+        [mod_payment_paypal, OrderId],
+        Context)
+    of
+        {ok, #{
+            <<"payment_nr">> := _PaymentNr,
+            <<"status">> := Status
+        }}
+            when Status =:= <<"new">>;
+                 Status =:= <<"pending">> ->
+            OrderId1 = z_convert:to_list(z_url:url_encode(OrderId)),
+            Endpoint = "/v2/checkout/orders/" ++ OrderId1 ++ "/capture",
+            case api_call(post, Endpoint, #{}, Context) of
+                {ok, Capture} ->
+                    sync_order_status_1(Capture, Context);
+                {error, _} = Error ->
+                    Error
+            end;
+        {ok, #{
+            <<"payment_nr">> := PaymentNr,
+            <<"status">> := <<"paid">>
+        }} ->
+            {ok, {PaymentNr, paid}};
+        {ok, #{
+            <<"payment_nr">> := PaymentNr,
+            <<"status">> := Status
+        }} ->
+            ?LOG_WARNING(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"Refusing to capture PayPal order for closed payment">>,
+                result => error,
+                reason => payment_closed,
+                payment_nr => PaymentNr,
+                paypal_order_id => OrderId,
+                status => z_convert:to_atom(Status)
+            }),
+            {error, {status, z_convert:to_atom(Status)}};
+        {error, enoent} ->
+            {error, notfound};
         {error, _} = Error ->
             Error
     end.
@@ -278,7 +430,7 @@ capture_order(OrderId, Context) ->
     when Order :: binary() | undefined | map(),
          Context :: z:context(),
          PaymentNr :: binary(),
-         Status :: new | pending | paid | cancelled | failed.
+         Status :: new | pending | paid | cancelled | failed | refunded | error.
 sync_order_status(undefined, _Context) ->
     {error, order_id};
 sync_order_status(OrderId, Context) when is_binary(OrderId) ->
@@ -340,18 +492,56 @@ order_datetime(#{ <<"create_time">> := DT }) ->
 order_datetime(_) ->
     calendar:universal_time().
 
+set_payment_status(PaymentNr, Status, DT, Order, Context)
+    when Status =:= new;
+         Status =:= pending ->
+    set_open_payment_status(PaymentNr, Status, DT, Order, Context);
 set_payment_status(PaymentNr, Status, DT, Order, Context) ->
+    set_payment_status_1(PaymentNr, Status, DT, Order, Context).
+
+set_open_payment_status(PaymentNr, Status, DT, Order, Context) ->
+    z_db:transaction(
+        fun(Ctx) ->
+            case z_db:qmap_row(
+                "select id, status
+                 from payment
+                 where payment_nr = $1
+                 for update",
+                [PaymentNr],
+                Ctx)
+            of
+                {ok, #{ <<"status">> := CurrentStatus }}
+                    when CurrentStatus =:= <<"new">>;
+                         CurrentStatus =:= <<"pending">> ->
+                    set_payment_status_1(PaymentNr, Status, DT, Order, Ctx);
+                {ok, #{
+                    <<"id">> := PaymentId,
+                    <<"status">> := CurrentStatus
+                }} ->
+                    log_order(PaymentId, Order, Ctx),
+                    ?LOG_WARNING(#{
+                        in => zotonic_mod_payment_paypal,
+                        text => <<"Ignoring open PayPal status for closed payment">>,
+                        result => ok,
+                        reason => payment_closed,
+                        payment_nr => PaymentNr,
+                        paypal_order_id => maps:get(<<"id">>, Order, undefined),
+                        paypal_status => maps:get(<<"status">>, Order, undefined),
+                        status => z_convert:to_atom(CurrentStatus)
+                    }),
+                    {ok, {PaymentNr, z_convert:to_atom(CurrentStatus)}};
+                {error, enoent} ->
+                    {error, notfound};
+                {error, _} = Error ->
+                    Error
+            end
+        end,
+        Context).
+
+set_payment_status_1(PaymentNr, Status, DT, Order, Context) ->
     case m_payment:get(PaymentNr, Context) of
         {ok, #{ <<"id">> := PaymentId, <<"status">> := CurrentStatus }} ->
-            m_payment_log:log(
-                PaymentId,
-                <<"paypal.order">>,
-                #{
-                    <<"psp_module">> => mod_payment_paypal,
-                    <<"psp_external_log_id">> => maps:get(<<"id">>, Order, undefined),
-                    <<"paypal_order">> => Order
-                },
-                Context),
+            log_order(PaymentId, Order, Context),
             ok = maybe_update_contact(PaymentId, Order, CurrentStatus, Status, Context),
             case mod_payment:set_payment_status(PaymentId, Status, DT, Context) of
                 ok -> {ok, {PaymentNr, Status}};
@@ -368,10 +558,27 @@ set_payment_status(PaymentNr, Status, DT, Order, Context) ->
             Error
     end.
 
+log_order(PaymentId, Order, Context) ->
+    m_payment_log:log(
+        PaymentId,
+        <<"paypal.order">>,
+        #{
+            <<"psp_module">> => mod_payment_paypal,
+            <<"psp_external_log_id">> => maps:get(<<"id">>, Order, undefined),
+            <<"paypal_order">> => Order
+        },
+        Context).
+
 %% @doc Retrieve an order from PayPal.
 fetch_order(OrderId, Context) ->
-    Url = "/v2/checkout/orders/" ++ binary_to_list(OrderId),
-    api_call(get, Url, undefined, Context).
+    case is_valid_order_id(OrderId) of
+        true ->
+            OrderId1 = z_convert:to_list(z_url:url_encode(OrderId)),
+            Url = "/v2/checkout/orders/" ++ OrderId1,
+            api_call(get, Url, undefined, Context);
+        false ->
+            {error, order_id}
+    end.
 
 maybe_update_contact(_PaymentId, _Order, _CurrentStatus, new, _Context) ->
     ok;
@@ -383,7 +590,9 @@ maybe_update_contact(PaymentId, Order, new, _Status, Context) ->
             maybe_fetch_and_update_contact(PaymentId, Order, Context);
         {error, _} = Error ->
             Error
-    end.
+    end;
+maybe_update_contact(_PaymentId, _Order, _CurrentStatus, _Status, _Context) ->
+    ok.
 
 maybe_fetch_and_update_contact(PaymentId, Order, Context) ->
     case payment_link_order_id(Order) of
@@ -464,20 +673,6 @@ paypal_name_props(Payer) ->
             #{}
     end.
 
-paypal_full_name_props(Name) when is_binary(Name) ->
-    case binary:split(z_string:trim(Name), <<" ">>, [global, trim_all]) of
-        [] ->
-            #{};
-        [<<>>] ->
-            #{};
-        [Surname] ->
-            #{ <<"name_surname">> => Surname };
-        [First | Rest] ->
-            #{ <<"name_first">> => First,
-               <<"name_surname">> => iolist_to_binary(lists:join(<<" ">>, Rest)) }
-    end;
-paypal_full_name_props(_) ->
-    #{}.
 
 paypal_address_props(Address) when is_map(Address) ->
     #{
@@ -592,6 +787,28 @@ capture_order_id(#{ <<"supplementary_data">> := #{ <<"related_ids">> := #{ <<"or
     OrderId;
 capture_order_id(_) ->
     undefined.
+
+%% @doc Paypal order ids are in the format: ^[A-Z0-9]+$ and have a length of 1..36 characters.
+%% Also accept lowercase a-z and a bit more characters, just to be future proof.
+is_valid_order_id(OrderId)
+    when
+        is_binary(OrderId),
+        size(OrderId) =< ?MAX_ORDERID_SIZE,
+        size(OrderId) >= ?MIN_ORDERID_SIZE ->
+    is_valid_order_id_1(OrderId);
+is_valid_order_id(_OrderId) ->
+    false.
+
+is_valid_order_id_1(<<>>) ->
+    true;
+is_valid_order_id_1(<<C, T/binary>>)
+    when
+        (C >= $A andalso C =< $Z) orelse
+        (C >= $a andalso C =< $z) orelse
+        (C >= $0 andalso C =< $9) ->
+    is_valid_order_id_1(T);
+is_valid_order_id_1(_) ->
+    false.
 
 is_valid_webhook_signature(Event, Context) ->
     case webhook_id(Context) of
