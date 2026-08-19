@@ -97,9 +97,43 @@ observe_payment_psp_status_sync(#payment_psp_status_sync{
                 payment_id => PaymentId,
                 paypal_order_id => OrderId
             }),
-            Error;
+            cancel_missing_open_payment(PaymentId, OrderId, Error, Context);
         {error, _} = Error ->
             Error
     end;
 observe_payment_psp_status_sync(#payment_psp_status_sync{}, _Context) ->
     undefined.
+
+-spec cancel_missing_open_payment(PaymentId, OrderId, Error, Context) -> Result
+    when
+        PaymentId :: integer(),
+        OrderId :: binary(),
+        Error :: {error, 404},
+        Context :: z:context(),
+        Result :: ok | {error, term()}.
+cancel_missing_open_payment(PaymentId, OrderId, Error, Context) ->
+    case m_payment:get(PaymentId, Context) of
+        {ok, #{ <<"status">> := Status }}
+            when Status =:= <<"new">>;
+                 Status =:= <<"pending">> ->
+            case mod_payment:set_payment_status(PaymentId, cancelled, Context) of
+                ok ->
+                    ?LOG_WARNING(#{
+                        in => zotonic_mod_payment_paypal,
+                        text => <<"PayPal payment set to cancelled because the order could not be found">>,
+                        result => ok,
+                        reason => paypal_order_not_found,
+                        payment_id => PaymentId,
+                        paypal_order_id => OrderId,
+                        previous_status => Status,
+                        status => cancelled
+                    }),
+                    ok;
+                {error, _} = SetError ->
+                    SetError
+            end;
+        {ok, _Payment} ->
+            Error;
+        {error, _} = PaymentError ->
+            PaymentError
+    end.
