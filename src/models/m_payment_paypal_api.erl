@@ -267,7 +267,7 @@ approve_urls(Rel, Links) ->
     when PaymentNr :: binary() | undefined,
          OrderId :: binary() | undefined,
          Context :: z:context(),
-         LocalStatus :: new | pending | paid | cancelled | failed,
+         LocalStatus :: new | pending | paid | cancelled | failed | refunded | error,
          PaypalStatus :: binary(),
          Result ::
              {ok, cancelled, {PaymentNr, cancelled}, PaypalStatus}
@@ -366,6 +366,32 @@ capture_order(undefined, _Context) ->
 capture_order(OrderId, Context) ->
     case is_valid_order_id(OrderId) of
         true ->
+            % PayPal has no cancel operation for CAPTURE orders. Keep the
+            % payment row locked while capturing, so a terminal local status
+            % is also an effective merchant-side closure of the PayPal order.
+            z_db:transaction(
+                fun(Ctx) -> capture_order_locked(OrderId, Ctx) end,
+                Context);
+        false ->
+            {error, order_id}
+    end.
+
+capture_order_locked(OrderId, Context) ->
+    case z_db:qmap_row(
+        "select payment_nr, status
+         from payment
+         where psp_module = $1
+           and psp_external_id = $2
+         for update",
+        [mod_payment_paypal, OrderId],
+        Context)
+    of
+        {ok, #{
+            <<"payment_nr">> := PaymentNr,
+            <<"status">> := Status
+        }}
+            when Status =:= <<"new">>;
+                 Status =:= <<"pending">> ->
             OrderId1 = z_convert:to_list(z_url:url_encode(OrderId)),
             Endpoint = "/v2/checkout/orders/" ++ OrderId1 ++ "/capture",
             case api_call(post, Endpoint, #{}, Context) of
@@ -374,8 +400,29 @@ capture_order(OrderId, Context) ->
                 {error, _} = Error ->
                     Error
             end;
-        false ->
-            {error, order_id}
+        {ok, #{
+            <<"payment_nr">> := PaymentNr,
+            <<"status">> := <<"paid">>
+        }} ->
+            {ok, {PaymentNr, paid}};
+        {ok, #{
+            <<"payment_nr">> := PaymentNr,
+            <<"status">> := Status
+        }} ->
+            ?LOG_WARNING(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"Refusing to capture PayPal order for closed payment">>,
+                result => error,
+                reason => payment_closed,
+                payment_nr => PaymentNr,
+                paypal_order_id => OrderId,
+                status => z_convert:to_atom(Status)
+            }),
+            {error, {status, z_convert:to_atom(Status)}};
+        {error, enoent} ->
+            {error, notfound};
+        {error, _} = Error ->
+            Error
     end.
 
 %% @doc Set the local status from an order map or an order id.
@@ -383,7 +430,7 @@ capture_order(OrderId, Context) ->
     when Order :: binary() | undefined | map(),
          Context :: z:context(),
          PaymentNr :: binary(),
-         Status :: new | pending | paid | cancelled | failed.
+         Status :: new | pending | paid | cancelled | failed | refunded | error.
 sync_order_status(undefined, _Context) ->
     {error, order_id};
 sync_order_status(OrderId, Context) when is_binary(OrderId) ->
@@ -445,18 +492,56 @@ order_datetime(#{ <<"create_time">> := DT }) ->
 order_datetime(_) ->
     calendar:universal_time().
 
+set_payment_status(PaymentNr, Status, DT, Order, Context)
+    when Status =:= new;
+         Status =:= pending ->
+    set_open_payment_status(PaymentNr, Status, DT, Order, Context);
 set_payment_status(PaymentNr, Status, DT, Order, Context) ->
+    set_payment_status_1(PaymentNr, Status, DT, Order, Context).
+
+set_open_payment_status(PaymentNr, Status, DT, Order, Context) ->
+    z_db:transaction(
+        fun(Ctx) ->
+            case z_db:qmap_row(
+                "select id, status
+                 from payment
+                 where payment_nr = $1
+                 for update",
+                [PaymentNr],
+                Ctx)
+            of
+                {ok, #{ <<"status">> := CurrentStatus }}
+                    when CurrentStatus =:= <<"new">>;
+                         CurrentStatus =:= <<"pending">> ->
+                    set_payment_status_1(PaymentNr, Status, DT, Order, Ctx);
+                {ok, #{
+                    <<"id">> := PaymentId,
+                    <<"status">> := CurrentStatus
+                }} ->
+                    log_order(PaymentId, Order, Ctx),
+                    ?LOG_WARNING(#{
+                        in => zotonic_mod_payment_paypal,
+                        text => <<"Ignoring open PayPal status for closed payment">>,
+                        result => ok,
+                        reason => payment_closed,
+                        payment_nr => PaymentNr,
+                        paypal_order_id => maps:get(<<"id">>, Order, undefined),
+                        paypal_status => maps:get(<<"status">>, Order, undefined),
+                        status => z_convert:to_atom(CurrentStatus)
+                    }),
+                    {ok, {PaymentNr, z_convert:to_atom(CurrentStatus)}};
+                {error, enoent} ->
+                    {error, notfound};
+                {error, _} = Error ->
+                    Error
+            end
+        end,
+        Context).
+
+set_payment_status_1(PaymentNr, Status, DT, Order, Context) ->
     case m_payment:get(PaymentNr, Context) of
         {ok, #{ <<"id">> := PaymentId, <<"status">> := CurrentStatus }} ->
-            m_payment_log:log(
-                PaymentId,
-                <<"paypal.order">>,
-                #{
-                    <<"psp_module">> => mod_payment_paypal,
-                    <<"psp_external_log_id">> => maps:get(<<"id">>, Order, undefined),
-                    <<"paypal_order">> => Order
-                },
-                Context),
+            log_order(PaymentId, Order, Context),
             ok = maybe_update_contact(PaymentId, Order, CurrentStatus, Status, Context),
             case mod_payment:set_payment_status(PaymentId, Status, DT, Context) of
                 ok -> {ok, {PaymentNr, Status}};
@@ -472,6 +557,17 @@ set_payment_status(PaymentNr, Status, DT, Order, Context) ->
             }),
             Error
     end.
+
+log_order(PaymentId, Order, Context) ->
+    m_payment_log:log(
+        PaymentId,
+        <<"paypal.order">>,
+        #{
+            <<"psp_module">> => mod_payment_paypal,
+            <<"psp_external_log_id">> => maps:get(<<"id">>, Order, undefined),
+            <<"paypal_order">> => Order
+        },
+        Context).
 
 %% @doc Retrieve an order from PayPal.
 fetch_order(OrderId, Context) ->
