@@ -156,6 +156,7 @@ order_payload(Payment, Context) ->
         z_dispatcher:url_for(
             paypal_payment_redirect,
             [ {payment_nr, PaymentNr}, {status, "ok"} ],
+            none,
             Context),
         Context),
     CancelUrl = z_context:abs_url(
@@ -166,6 +167,7 @@ order_payload(Payment, Context) ->
                 {status, "cancel"},
                 {state, CancelState}
             ],
+            none,
             Context),
         Context),
     #{
