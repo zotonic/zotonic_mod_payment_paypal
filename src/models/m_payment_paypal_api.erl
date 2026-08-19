@@ -401,7 +401,9 @@ maybe_update_contact(PaymentId, Order, new, _Status, Context) ->
             maybe_fetch_and_update_contact(PaymentId, Order, Context);
         {error, _} = Error ->
             Error
-    end.
+    end;
+maybe_update_contact(_PaymentId, _Order, _CurrentStatus, _Status, _Context) ->
+    ok.
 
 maybe_fetch_and_update_contact(PaymentId, Order, Context) ->
     case payment_link_order_id(Order) of
