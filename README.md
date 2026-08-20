@@ -1,6 +1,6 @@
 # Zotonic PayPal payment module
 
-Payment Service Provider module for `zotonic_mod_payment` using PayPal REST Orders v2.
+Payment Service Provider module for [zotonic_mod_payment](https://github.com/zotonic/zotonic_mod_payment) using PayPal REST Orders v2.
 
 ## Configuration
 
