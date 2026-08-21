@@ -20,6 +20,7 @@
 
 -export([
     create/2,
+    amount_string/2,
 
     payment_url/2,
 
@@ -181,7 +182,7 @@ order_payload(Payment, Context) ->
                 <<"description">> => valid_description(maps:get(<<"description">>, Payment)),
                 <<"amount">> => #{
                     <<"currency_code">> => Currency,
-                    <<"value">> => amount_string(Amount)
+                    <<"value">> => amount_string(Amount, Currency)
                 }
             }
         ],
@@ -200,7 +201,15 @@ order_payload(Payment, Context) ->
 valid_description(undefined) -> <<>>;
 valid_description(D) when is_binary(D) -> D.
 
-amount_string(Amount) ->
+%% PayPal requires whole-unit values for these zero-decimal currencies.
+-spec amount_string(number(), binary()) -> binary().
+amount_string(Amount, Currency)
+    when Currency =:= <<"HUF">>;
+         Currency =:= <<"JPY">>;
+         Currency =:= <<"TWD">>
+->
+    integer_to_binary(round(z_convert:to_float(Amount)));
+amount_string(Amount, _Currency) ->
     z_convert:to_binary(io_lib:format("~.2f", [z_convert:to_float(Amount)])).
 
 log_create_error(PaymentId, Args, Result, Context) ->
