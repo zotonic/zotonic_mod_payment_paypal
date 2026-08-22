@@ -35,7 +35,7 @@ is_authorized(Context) ->
     {Body, Context1} = cowmachine_req:req_body(Context),
     case decode_json(Body) of
         {ok, Event} ->
-            case m_payment_paypal_api:is_valid_webhook_signature(Event, Context1) of
+            case m_payment_paypal_api:is_valid_webhook_signature(Body, Context1) of
                 true ->
                     Context2 = z_context:set(<<"body">>, Body, Context1),
                     {true, z_context:set(<<"paypal_event">>, Event, Context2)};

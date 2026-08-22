@@ -32,6 +32,7 @@
     fetch_order/2,
     webhook_event/2,
     is_valid_webhook_signature/2,
+    webhook_verification_payload/3,
 
     credentials/1
 ]).
@@ -819,42 +820,92 @@ is_valid_order_id_1(<<C, T/binary>>)
 is_valid_order_id_1(_) ->
     false.
 
-is_valid_webhook_signature(Event, Context) ->
+-spec is_valid_webhook_signature(Body, Context) -> boolean()
+    when
+        Body :: binary(),
+        Context :: z:context().
+is_valid_webhook_signature(Body, Context) when is_binary(Body) ->
     case webhook_id(Context) of
         {ok, WebhookId} ->
-            Payload = #{
+            Headers = #{
                 <<"auth_algo">> => z_context:get_req_header(<<"paypal-auth-algo">>, Context),
                 <<"cert_url">> => z_context:get_req_header(<<"paypal-cert-url">>, Context),
                 <<"transmission_id">> => z_context:get_req_header(<<"paypal-transmission-id">>, Context),
                 <<"transmission_sig">> => z_context:get_req_header(<<"paypal-transmission-sig">>, Context),
-                <<"transmission_time">> => z_context:get_req_header(<<"paypal-transmission-time">>, Context),
-                <<"webhook_id">> => WebhookId,
-                <<"webhook_event">> => Event
+                <<"transmission_time">> => z_context:get_req_header(<<"paypal-transmission-time">>, Context)
             },
-            case api_call(post, "/v1/notifications/verify-webhook-signature", Payload, Context) of
-                {ok, #{ <<"verification_status">> := <<"SUCCESS">> }} ->
-                    true;
-                {ok, Verification} ->
+            case missing_webhook_headers(Headers) of
+                [] ->
+                    Payload = webhook_verification_payload(Body, WebhookId, Headers),
+                    verify_webhook_signature(Payload, Context);
+                Missing ->
                     ?LOG_ERROR(#{
                         in => zotonic_mod_payment_paypal,
-                        text => <<"PayPal webhook signature verification failed">>,
+                        text => <<"PayPal webhook signature headers are missing">>,
                         result => error,
-                        reason => verification_failed,
-                        verification => Verification
-                    }),
-                    false;
-                {error, Error} ->
-                    ?LOG_ERROR(#{
-                        in => zotonic_mod_payment_paypal,
-                        text => <<"PayPal webhook signature verification error">>,
-                        result => error,
-                        reason => Error
+                        reason => missing_headers,
+                        headers => Missing
                     }),
                     false
             end;
         {error, _} ->
+            ?LOG_ERROR(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"PayPal webhook id is not configured">>,
+                result => error,
+                reason => webhook_id
+            }),
             false
     end.
+
+verify_webhook_signature(Payload, Context) ->
+    case api_call(post, "/v1/notifications/verify-webhook-signature", Payload, Context) of
+        {ok, #{ <<"verification_status">> := <<"SUCCESS">> }} ->
+            true;
+        {ok, Verification} ->
+            ?LOG_ERROR(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"PayPal webhook signature verification failed">>,
+                result => error,
+                reason => verification_failed,
+                verification => Verification
+            }),
+            false;
+        {error, Error} ->
+            ?LOG_ERROR(#{
+                in => zotonic_mod_payment_paypal,
+                text => <<"PayPal webhook signature verification error">>,
+                result => error,
+                reason => Error
+            }),
+            false
+    end.
+
+missing_webhook_headers(Headers) ->
+    [
+        Key
+        || {Key, Value} <- maps:to_list(Headers),
+           not is_binary(Value) orelse Value =:= <<>>
+    ].
+
+%% @doc Build the verification request while preserving the webhook event
+%% byte-for-byte. PayPal verifies the signature against the original JSON body.
+-spec webhook_verification_payload(Body, WebhookId, Headers) -> binary()
+    when
+        Body :: binary(),
+        WebhookId :: binary(),
+        Headers :: #{ binary() => binary() }.
+webhook_verification_payload(Body, WebhookId, Headers) ->
+    iolist_to_binary([
+        <<"{\"auth_algo\":">>, z_json:encode(maps:get(<<"auth_algo">>, Headers)),
+        <<",\"cert_url\":">>, z_json:encode(maps:get(<<"cert_url">>, Headers)),
+        <<",\"transmission_id\":">>, z_json:encode(maps:get(<<"transmission_id">>, Headers)),
+        <<",\"transmission_sig\":">>, z_json:encode(maps:get(<<"transmission_sig">>, Headers)),
+        <<",\"transmission_time\":">>, z_json:encode(maps:get(<<"transmission_time">>, Headers)),
+        <<",\"webhook_id\":">>, z_json:encode(WebhookId),
+        <<",\"webhook_event\":">>, Body,
+        <<"}">>
+    ]).
 
 webhook_id(Context) ->
     case m_config:get_value(mod_payment_paypal, webhook_id, Context) of
