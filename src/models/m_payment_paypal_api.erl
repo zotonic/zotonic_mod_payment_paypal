@@ -28,6 +28,7 @@
     mark_order_cancelled/2,
     capture_order/2,
     sync_order_status/2,
+    order_payment_status/1,
 
     fetch_order/2,
     webhook_event/2,
@@ -453,8 +454,8 @@ sync_order_status(#{ <<"id">> := _ } = Order, Context) ->
 
 sync_order_status_1(Order, Context) ->
     DT = order_datetime(Order),
-    case {payment_nr(Order), maps:get(<<"status">>, Order, undefined)} of
-        {undefined, _Status} ->
+    case payment_nr(Order) of
+        undefined ->
             ?LOG_ERROR(#{
                 in => zotonic_mod_payment_paypal,
                 text => <<"PayPal order status has no local payment reference">>,
@@ -463,30 +464,90 @@ sync_order_status_1(Order, Context) ->
                 order => Order
             }),
             {error, payment_nr};
-        {PaymentNr, <<"CREATED">>} ->
-            set_payment_status(PaymentNr, new, DT, Order, Context);
-        {PaymentNr, <<"SAVED">>} ->
-            set_payment_status(PaymentNr, new, DT, Order, Context);
-        {PaymentNr, <<"PAYER_ACTION_REQUIRED">>} ->
-            set_payment_status(PaymentNr, pending, DT, Order, Context);
-        {PaymentNr, <<"APPROVED">>} ->
-            set_payment_status(PaymentNr, pending, DT, Order, Context);
-        {PaymentNr, <<"COMPLETED">>} ->
-            set_payment_status(PaymentNr, paid, DT, Order, Context);
-        {PaymentNr, <<"VOIDED">>} ->
-            set_payment_status(PaymentNr, cancelled, DT, Order, Context);
-        {PaymentNr, Status} ->
-            ?LOG_ERROR(#{
-                in => zotonic_mod_payment_paypal,
-                text => <<"PayPal order status is unknown">>,
-                result => error,
-                reason => order_status,
-                payment_nr => PaymentNr,
-                status => Status,
-                order => Order
-            }),
-            {error, order_status}
+        PaymentNr ->
+            case order_payment_status(Order) of
+                {ok, Status} ->
+                    set_payment_status(PaymentNr, Status, DT, Order, Context);
+                {error, {Reason, Status}} ->
+                    ?LOG_ERROR(#{
+                        in => zotonic_mod_payment_paypal,
+                        text => <<"PayPal order has no supported payment status">>,
+                        result => error,
+                        reason => Reason,
+                        payment_nr => PaymentNr,
+                        paypal_order_status => maps:get(<<"status">>, Order, undefined),
+                        paypal_payment_status => Status,
+                        order => Order
+                    }),
+                    {error, Reason}
+            end
     end.
+
+%% @doc Map a PayPal order and its capture details to a local payment status.
+%% An order can be completed while its capture is still pending or has failed,
+%% so a completed order is never sufficient on its own to mark a payment paid.
+-spec order_payment_status(Order) -> Result
+    when
+        Order :: map(),
+        Status :: new | pending | paid | cancelled | failed | refunded,
+        Reason :: order_status | capture_status,
+        Result :: {ok, Status} | {error, {Reason, term()}}.
+order_payment_status(#{ <<"status">> := <<"CREATED">> }) ->
+    {ok, new};
+order_payment_status(#{ <<"status">> := <<"SAVED">> }) ->
+    {ok, new};
+order_payment_status(#{ <<"status">> := <<"PAYER_ACTION_REQUIRED">> }) ->
+    {ok, new};
+order_payment_status(#{ <<"status">> := <<"APPROVED">> }) ->
+    {ok, pending};
+order_payment_status(#{ <<"status">> := <<"COMPLETED">> } = Order) ->
+    capture_payment_status(Order);
+order_payment_status(#{ <<"status">> := <<"VOIDED">> }) ->
+    {ok, cancelled};
+order_payment_status(Order) ->
+    {error, {order_status, maps:get(<<"status">>, Order, undefined)}}.
+
+-spec capture_payment_status(map()) ->
+    {ok, pending | paid | failed | refunded} | {error, {capture_status, term()}}.
+capture_payment_status(Order) ->
+    Statuses = lists:usort(capture_statuses(Order)),
+    case Statuses of
+        [ <<"COMPLETED">> ] ->
+            {ok, paid};
+        [ <<"PENDING">> ] ->
+            {ok, pending};
+        [ <<"REFUNDED">> ] ->
+            {ok, refunded};
+        [ <<"PARTIALLY_REFUNDED">> ] ->
+            % There is no local partially-refunded status. The payment remains paid.
+            {ok, paid};
+        [] ->
+            {error, {capture_status, undefined}};
+        _ ->
+            case lists:all(fun is_failed_capture_status/1, Statuses) of
+                true -> {ok, failed};
+                false -> {error, {capture_status, Statuses}}
+            end
+    end.
+
+-spec capture_statuses(map()) -> [binary()].
+capture_statuses(#{ <<"purchase_units">> := PurchaseUnits }) when is_list(PurchaseUnits) ->
+    lists:flatmap(
+        fun
+            (#{ <<"payments">> := #{ <<"captures">> := Captures } }) when is_list(Captures) ->
+                [ Status || #{ <<"status">> := Status } <- Captures, is_binary(Status) ];
+            (_) ->
+                []
+        end,
+        PurchaseUnits);
+capture_statuses(_Order) ->
+    [].
+
+-spec is_failed_capture_status(binary()) -> boolean().
+is_failed_capture_status(<<"DECLINED">>) -> true;
+is_failed_capture_status(<<"DENIED">>) -> true;
+is_failed_capture_status(<<"FAILED">>) -> true;
+is_failed_capture_status(_) -> false.
 
 payment_nr(#{ <<"purchase_units">> := [ Unit | _ ] }) ->
     maps:get(<<"custom_id">>, Unit, maps:get(<<"reference_id">>, Unit, undefined));
