@@ -62,8 +62,8 @@ is_authorized(Context) ->
         {ok, Event} ->
             case m_payment_paypal_api:is_valid_webhook_signature(Body, Context1) of
                 true ->
-                    Context2 = z_context:set(<<"body">>, Body, Context1),
-                    {true, z_context:set(<<"paypal_event">>, Event, Context2)};
+                    Context2 = z_context:set(body, Body, Context1),
+                    {true, z_context:set(paypal_event, Event, Context2)};
                 false ->
                     ?LOG_ERROR(#{
                         in => zotonic_mod_payment_paypal,
@@ -84,7 +84,7 @@ is_authorized(Context) ->
     end.
 
 process(<<"POST">>, _AcceptedCT, _ProvidedCT, Context) ->
-    Event = z_context:get(<<"paypal_event">>, Context),
+    Event = z_context:get(paypal_event, Context),
     case m_payment_paypal_api:webhook_event(Event, Context) of
         ok ->
             {true, Context};

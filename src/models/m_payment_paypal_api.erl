@@ -791,9 +791,7 @@ paypal_address_props(Address) when is_map(Address) ->
         <<"address_city">> => maps:get(<<"admin_area_2">>, Address, undefined),
         <<"address_state">> => maps:get(<<"admin_area_1">>, Address, undefined),
         <<"address_country">> => maps:get(<<"country_code">>, Address, undefined)
-    };
-paypal_address_props(_) ->
-    #{}.
+    }.
 
 paypal_phone(#{ <<"phone">> := #{ <<"phone_number">> := #{ <<"national_number">> := Phone } } }) ->
     Phone;
