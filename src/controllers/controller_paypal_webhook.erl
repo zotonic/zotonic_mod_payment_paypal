@@ -17,6 +17,31 @@
 %% limitations under the License.
 
 -module(controller_paypal_webhook).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "integrator", "controller",
+        "payments", "api_and_integration", "security", "send_and_receive"
+    ]
+}).
+-moduledoc("
+Handle PayPal checkout callbacks.
+
+Accept POST events at `/paypal/webhook`. Decode JSON and verify the signature
+through PayPal using the configured webhook ID before processing supported events.
+Verified updates enter the shared payment receive logic. Unknown-payment imports
+depend on mod_payment configuration. Missing payments return 404 and processing
+failures return 500.
+
+Generate the endpoint through its dispatch rule, for example:
+
+```django
+{% url paypal_payment_webhook %}
+```
+
+This provider-facing endpoint uses the verification described above rather than
+an administrator login.
+").
+
 
 -author("Marc Worrell <marc@worrell.nl>").
 

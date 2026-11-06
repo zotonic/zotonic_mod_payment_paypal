@@ -1,0 +1,22 @@
+# Translations for mod_payment_paypal.
+msgid ""
+msgstr ""
+"Project-Id-Version: mod_payment_paypal\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-11-06 12:00+0100\n"
+"PO-Revision-Date: 2026-11-06 12:00+0100\n"
+"Last-Translator: Zotonic contributors\n"
+"Language-Team: vi\n"
+"Language: vi\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#: zotonic_mod_payment_paypal/priv/templates/_admin_payment_config_psp.tpl:1
+msgid "PayPal"
+msgstr "PayPal"
+
+#: zotonic_mod_payment_paypal/priv/templates/_admin_payment_config_psp.tpl:1
+msgid "Webhooks are scoped to the PayPal app. Enable reporting polling only if the app has Transaction Search permission; it also requires collecting all payments to be enabled."
+msgstr "Webhook chỉ áp dụng cho ứng dụng PayPal. Chỉ bật truy vấn báo cáo định kỳ nếu ứng dụng có quyền Transaction Search. Đồng thời phải bật thu thập tất cả khoản thanh toán."

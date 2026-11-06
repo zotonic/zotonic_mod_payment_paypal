@@ -1,0 +1,1 @@
+{% include "_admin_payment_config_section.tpl" module=`mod_payment_paypal` title=_"PayPal" explanation=_"Webhooks are scoped to the PayPal app. Enable reporting polling only if the app has Transaction Search permission; it also requires collecting all payments to be enabled." %}

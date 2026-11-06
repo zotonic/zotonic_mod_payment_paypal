@@ -18,12 +18,52 @@
 %% limitations under the License.
 
 -module(mod_payment_paypal).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "site_administrator", "module",
+        "payments", "configuration", "api_and_integration"
+    ]
+}).
+-moduledoc("
+Provide PayPal Orders checkout through `mod_payment`.
+
+Enable this module together with `mod_payment`. Select it with
+`#payment_request{preferred_psp_module = mod_payment_paypal}`. Recurring checkout
+creation is not supported.
+
+## Site configuration
+
+Use **System → Payment configuration** with `use.mod_admin_config` to set:
+
+- `is_live`: use PayPal live instead of sandbox; defaults to false.
+- `client_id` and `secret`: REST API credentials for that environment.
+- `webhook_id`: the ID of the PayPal webhook registered for `/paypal/webhook`,
+  used when verifying incoming signatures.
+- `enable_reporting_polling`: opt into Transaction Search discovery. Defaults to
+  false and requires the additional `reporting/search/read` permission.
+
+The return route `/paypal/ready/:payment_nr` captures approved orders. Cancellation
+uses signed state and checks the remote order before changing local status.
+Webhooks are verified through PayPal before passing supported events to the shared
+payment receive logic.
+
+Unknown-payment imports require `mod_payment.accept_unknown_payments`. Four-hour
+reporting discovery also requires `enable_reporting_polling` and an unset/false
+`mod_payment.disable_unknown_payment_polling`. It selects positive payment
+transactions within the retention window, not every account ledger entry.
+Ordinary checkout and webhooks do not require the reporting option.
+").
+
 
 -mod_title("Payments using PayPal").
 -mod_description("Payments using Payment Service Provider PayPal").
 -mod_author("Driebit").
 -mod_depends([ mod_payment ]).
 -mod_config([
+    #{key => enable_reporting_polling,
+      type => boolean,
+      default => false,
+      description => "Discover account payments using Transaction Search; requires the extra reporting/search/read permission."},
     #{
         key => is_live,
         type => boolean,
@@ -38,6 +78,7 @@
     },
     #{
         key => secret,
+        is_secret => true,
         type => binary,
         default => <<>>,
         description => "PayPal REST API secret."
@@ -55,7 +96,8 @@
 -export([
     observe_payment_psp_request/2,
     observe_payment_psp_view_url/2,
-    observe_payment_psp_status_sync/2
+    observe_payment_psp_status_sync/2,
+    observe_payment_psp_poll/2
 ]).
 
 -include_lib("zotonic_core/include/zotonic.hrl").
@@ -80,6 +122,16 @@ observe_payment_psp_view_url(#payment_psp_view_url{}, _Context) ->
     undefined.
 
 %% @doc Synchronize the payment status from PayPal to the local payment tables.
+observe_payment_psp_status_sync(#payment_psp_status_sync{
+        psp_module = ?MODULE,
+        psp_data = #{<<"reporting_transaction">> := Info}
+    }, Context) ->
+    payment_paypal_poll:sync(Info, Context);
+observe_payment_psp_status_sync(#payment_psp_status_sync{
+        psp_module = ?MODULE,
+        psp_external_id = <<"capture:", CaptureId/binary>>
+    }, Context) ->
+    m_payment_paypal_api:receive_capture(CaptureId, Context);
 observe_payment_psp_status_sync(#payment_psp_status_sync{
         payment_id = PaymentId,
         psp_module = ?MODULE,
@@ -140,3 +192,14 @@ cancel_missing_open_payment(PaymentId, OrderId, Error, Context) ->
         {error, _} = PaymentError ->
             PaymentError
     end.
+
+%% Discovery pages are imported and checkpointed by mod_payment.
+observe_payment_psp_poll(#payment_psp_poll{psp_module = undefined}, Context) ->
+    case m_config:get_boolean(?MODULE, enable_reporting_polling, Context) of
+        true -> ?MODULE;
+        false -> undefined
+    end;
+observe_payment_psp_poll(#payment_psp_poll{psp_module = ?MODULE} = Request, Context) ->
+    payment_paypal_poll:page(Request, Context);
+observe_payment_psp_poll(#payment_psp_poll{}, _Context) ->
+    undefined.
