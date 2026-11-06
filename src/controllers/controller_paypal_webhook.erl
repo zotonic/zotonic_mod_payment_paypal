@@ -17,6 +17,31 @@
 %% limitations under the License.
 
 -module(controller_paypal_webhook).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "integrator", "controller",
+        "payments", "api_and_integration", "security", "send_and_receive"
+    ]
+}).
+-moduledoc("
+Handle PayPal checkout callbacks.
+
+Accept POST events at `/paypal/webhook`. Decode JSON and verify the signature
+through PayPal using the configured webhook ID before processing supported events.
+Verified updates enter the shared payment receive logic. Unknown-payment imports
+depend on mod_payment configuration. Missing payments return 404 and processing
+failures return 500.
+
+Generate the endpoint through its dispatch rule, for example:
+
+```django
+{% url paypal_payment_webhook %}
+```
+
+This provider-facing endpoint uses the verification described above rather than
+an administrator login.
+").
+
 
 -author("Marc Worrell <marc@worrell.nl>").
 
@@ -37,8 +62,8 @@ is_authorized(Context) ->
         {ok, Event} ->
             case m_payment_paypal_api:is_valid_webhook_signature(Body, Context1) of
                 true ->
-                    Context2 = z_context:set(<<"body">>, Body, Context1),
-                    {true, z_context:set(<<"paypal_event">>, Event, Context2)};
+                    Context2 = z_context:set(body, Body, Context1),
+                    {true, z_context:set(paypal_event, Event, Context2)};
                 false ->
                     ?LOG_ERROR(#{
                         in => zotonic_mod_payment_paypal,
@@ -59,7 +84,7 @@ is_authorized(Context) ->
     end.
 
 process(<<"POST">>, _AcceptedCT, _ProvidedCT, Context) ->
-    Event = z_context:get(<<"paypal_event">>, Context),
+    Event = z_context:get(paypal_event, Context),
     case m_payment_paypal_api:webhook_event(Event, Context) of
         ok ->
             {true, Context};

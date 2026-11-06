@@ -1,3 +1,21 @@
+%% @copyright 2026 Marc Worrell
+%% @doc Tests for PayPal amounts, orders and payment status handling.
+%% @end
+
+%% Copyright 2026 Marc Worrell
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+
 -module(m_payment_paypal_api_tests).
 -moduledoc("
 EUnit tests for PayPal API value formatting, payment status mapping, and webhook verification.
@@ -72,3 +90,31 @@ completed_order_status(CaptureStatus) ->
             }
         ]
     }).
+
+external_order_test() ->
+    Unit = #{<<"amount">> => #{<<"currency_code">> => <<"EUR">>, <<"value">> => <<"12.34">>},
+             <<"payments">> => #{<<"captures">> => [#{<<"status">> => <<"COMPLETED">>}]}},
+    Order = #{<<"id">> => <<"ORDER1">>, <<"status">> => <<"COMPLETED">>,
+              <<"purchase_units">> => [Unit], <<"update_time">> => <<"2026-10-29T10:00:00Z">>},
+    {ok, D} = m_payment_paypal_api:webhook_payment(Order),
+    ?assertEqual(undefined, maps:get(payment_nr, D)),
+    ?assertEqual(<<"ORDER1">>, maps:get(psp_external_id, D)),
+    ?assertEqual(paid, maps:get(status, D)),
+    ?assertEqual(12.34, maps:get(amount, D)),
+    {ok, Multi} = m_payment_paypal_api:webhook_payment(Order#{<<"purchase_units">> => [Unit, Unit]}),
+    ?assertEqual(24.68, maps:get(amount, Multi)),
+    ?assertEqual({error, amount}, m_payment_paypal_api:webhook_payment(Order#{<<"purchase_units">> =>
+        [Unit, Unit#{<<"amount">> => #{<<"currency_code">> => <<"USD">>, <<"value">> => <<"1">>}}]})).
+
+external_capture_and_refund_test() ->
+    Capture = #{<<"id">> => <<"CAPTURE1">>, <<"status">> => <<"PARTIALLY_REFUNDED">>,
+        <<"amount">> => #{<<"currency_code">> => <<"USD">>, <<"value">> => <<"100.00">>}},
+    {ok, D} = m_payment_paypal_api:webhook_payment(Capture),
+    ?assertEqual(<<"capture:CAPTURE1">>, maps:get(psp_external_id, D)),
+    ?assertEqual(100.0, maps:get(amount, D)),
+    ?assertEqual(paid, maps:get(status, D)),
+    Refund = #{<<"id">> => <<"REFUND1">>, <<"links">> => [#{<<"rel">> => <<"up">>,
+        <<"href">> => <<"https://api-m.paypal.com/v2/payments/captures/CAPTURE1">>}]},
+    ?assertEqual(<<"CAPTURE1">>, m_payment_paypal_api:refund_capture_id(Refund)),
+    ?assertEqual(undefined, m_payment_paypal_api:refund_capture_id(#{<<"links">> => [#{
+        <<"rel">> => <<"up">>, <<"href">> => <<"https://api-m.paypal.com/v2/payments/captures/../../other">>}]})).

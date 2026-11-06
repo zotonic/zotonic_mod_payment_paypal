@@ -17,6 +17,31 @@
 %% limitations under the License.
 
 -module(controller_paypal_redirect).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "integrator", "controller",
+        "payments", "api_and_integration", "routing_and_redirects"
+    ]
+}).
+-moduledoc("
+Handle PayPal checkout callbacks.
+
+Handle GET returns at `/paypal/ready/:payment_nr`. Approval captures the order
+identified by `token`. Cancellation requires valid signed state and a matching
+local order, and checks the provider's current status before cancelling it.
+Redirect the visitor to `payment_psp_done`; the browser's query parameters alone
+are not proof of payment.
+
+Generate the endpoint through its dispatch rule, for example:
+
+```django
+{% url paypal_payment_redirect payment_nr=payment_nr %}
+```
+
+This provider-facing endpoint uses the verification described above rather than
+an administrator login.
+").
+
 
 -export([
     allowed_methods/1,

@@ -17,6 +17,33 @@
 %% limitations under the License.
 
 -module(m_payment_paypal_api).
+-moduledoc(#{
+    zotonic_keywords => [
+        "reference", "backend_developer", "integrator", "model",
+        "payments", "api_and_integration"
+    ]
+}).
+-moduledoc("
+Create, capture and synchronize PayPal Orders and verify webhook events.
+
+This module exposes trusted Erlang APIs and has no template model paths.
+`create(PaymentNr, Context)` creates an order for an existing local payment,
+returning `{ok, #payment_psp_handler{}}` or an error. Recurring creation is unsupported.
+
+For example, `m_payment_paypal_api:fetch_order(OrderId, Context)` returns
+`{ok, OrderMap}` or `{error, Reason}`. `capture_order/2` captures an approved order;
+`sync_order_status/2` refreshes its local status. `ping(Context)` returns `ok` if
+configured credentials can obtain an OAuth token, or `{error, Reason}`.
+
+Credentials and the live/sandbox selection come from mod_payment_paypal settings.
+Webhook signature verification uses `webhook_id` and PayPal's verification API.
+`webhook_event/2` processes already verified events; callers must not send unverified
+request bodies directly to it. Direct calls do not enforce administrative ACLs.
+").
+
+
+%% Exported for the documented HTTP contract tests in test/.
+-export([api_call/4]).
 
 -export([
     create/2,
@@ -32,6 +59,9 @@
 
     fetch_order/2,
     webhook_event/2,
+    webhook_payment/1,
+    refund_capture_id/1,
+    receive_capture/2,
     is_valid_webhook_signature/2,
     webhook_verification_payload/3,
 
@@ -454,7 +484,7 @@ sync_order_status(#{ <<"id">> := _ } = Order, Context) ->
 
 sync_order_status_1(Order, Context) ->
     DT = order_datetime(Order),
-    case payment_nr(Order) of
+    case local_payment_nr(Order, Context) of
         undefined ->
             ?LOG_ERROR(#{
                 in => zotonic_mod_payment_paypal,
@@ -481,6 +511,12 @@ sync_order_status_1(Order, Context) ->
                     }),
                     {error, Reason}
             end
+    end.
+
+local_payment_nr(#{ <<"id">> := Id } = Order, Context) ->
+    case m_payment:get_by_psp(mod_payment_paypal, Id, Context) of
+        {ok, #{ <<"payment_nr">> := Nr }} -> Nr;
+        _ -> payment_nr(Order)
     end.
 
 %% @doc Map a PayPal order and its capture details to a local payment status.
@@ -516,6 +552,8 @@ capture_payment_status(Order) ->
             {ok, paid};
         [ <<"PENDING">> ] ->
             {ok, pending};
+        [ <<"REVERSED">> ] ->
+            {ok, refunded};
         [ <<"REFUNDED">> ] ->
             {ok, refunded};
         [ <<"PARTIALLY_REFUNDED">> ] ->
@@ -753,9 +791,7 @@ paypal_address_props(Address) when is_map(Address) ->
         <<"address_city">> => maps:get(<<"admin_area_2">>, Address, undefined),
         <<"address_state">> => maps:get(<<"admin_area_1">>, Address, undefined),
         <<"address_country">> => maps:get(<<"country_code">>, Address, undefined)
-    };
-paypal_address_props(_) ->
-    #{}.
+    }.
 
 paypal_phone(#{ <<"phone">> := #{ <<"phone_number">> := #{ <<"national_number">> := Phone } } }) ->
     Phone;
@@ -767,6 +803,8 @@ paypal_phone(_) ->
     when OrderId :: binary(),
          Context :: z:context(),
          Url :: binary().
+payment_url(<<"capture:", CaptureId/binary>>, Context) ->
+    payment_url(CaptureId, Context);
 payment_url(OrderId, Context) ->
     case is_live(Context) of
         true ->
@@ -775,77 +813,141 @@ payment_url(OrderId, Context) ->
             <<"https://www.sandbox.paypal.com/activity/payment/", OrderId/binary>>
     end.
 
-webhook_event(#{ <<"event_type">> := EventType, <<"resource">> := Resource }, Context) ->
+webhook_event(#{ <<"event_type">> := EventType, <<"resource">> := Resource } = Event, Context) ->
+    Ctx = z_context:set(payment_event_id, maps:get(<<"id">>, Event, undefined), Context),
     case EventType of
-        <<"CHECKOUT.ORDER.APPROVED">> ->
-            sync_webhook_order(Resource, Context);
-        <<"CHECKOUT.ORDER.COMPLETED">> ->
-            sync_webhook_order(Resource, Context);
-        <<"PAYMENT.CAPTURE.COMPLETED">> ->
-            sync_capture_completed(Resource, Context);
-        <<"PAYMENT.CAPTURE.DENIED">> ->
-            sync_capture_status(Resource, failed, Context);
-        <<"PAYMENT.CAPTURE.DECLINED">> ->
-            sync_capture_status(Resource, failed, Context);
-        <<"PAYMENT.CAPTURE.PENDING">> ->
-            sync_capture_status(Resource, pending, Context);
-        <<"PAYMENT.CAPTURE.REFUNDED">> ->
-            sync_capture_status(Resource, refunded, Context);
-        <<"PAYMENT.CAPTURE.REVERSED">> ->
-            sync_capture_status(Resource, refunded, Context);
-        _ ->
-            ok
+        <<"CHECKOUT.ORDER.APPROVED">> -> receive_webhook_order(Resource, Ctx);
+        <<"CHECKOUT.ORDER.COMPLETED">> -> receive_webhook_order(Resource, Ctx);
+        <<"PAYMENT.CAPTURE.REFUNDED">> -> receive_capture(refund_capture_id(Resource), Ctx);
+        <<"PAYMENT.CAPTURE.COMPLETED">> -> receive_capture(maps:get(<<"id">>, Resource, undefined), Ctx);
+        <<"PAYMENT.CAPTURE.DENIED">> -> receive_capture(maps:get(<<"id">>, Resource, undefined), Ctx);
+        <<"PAYMENT.CAPTURE.DECLINED">> -> receive_capture(maps:get(<<"id">>, Resource, undefined), Ctx);
+        <<"PAYMENT.CAPTURE.PENDING">> -> receive_capture(maps:get(<<"id">>, Resource, undefined), Ctx);
+        <<"PAYMENT.CAPTURE.REVERSED">> -> receive_capture(maps:get(<<"id">>, Resource, undefined), Ctx);
+        _ -> ok
     end;
-webhook_event(Payload, _Context) ->
-    ?LOG_ERROR(#{
-        in => zotonic_mod_payment_paypal,
-        text => <<"Unknown payload when processing PayPal webhook data">>,
-        result => error,
-        reason => payload,
-        payload => Payload
-    }),
-    {error, payload}.
+webhook_event(_, _Context) -> {error, payload}.
 
-sync_webhook_order(#{ <<"id">> := OrderId }, Context) ->
-    case sync_order_status(OrderId, Context) of
-        {ok, {_PaymentNr, _Status}} -> ok;
+receive_webhook_order(#{ <<"id">> := OrderId }, Context) ->
+    case fetch_order(OrderId, Context) of
+        {ok, Order} -> receive_webhook_payment(Order, Context);
         {error, _} = Error -> Error
     end;
-sync_webhook_order(Payload, _Context) ->
-    ?LOG_ERROR(#{
-        in => zotonic_mod_payment_paypal,
-        text => <<"PayPal webhook order payload has no id">>,
-        result => error,
-        reason => order_id,
-        payload => Payload
-    }),
-    {error, order_id}.
+receive_webhook_order(_, _) -> {error, order_id}.
 
-sync_capture_status(Resource, Status, Context) ->
-    case capture_payment_nr(Resource) of
-        undefined ->
-            ?LOG_ERROR(#{
-                in => zotonic_mod_payment_paypal,
-                text => <<"PayPal capture webhook has no local payment reference">>,
-                result => error,
-                reason => payment_nr,
-                resource => Resource
-            }),
-            {error, payment_nr};
-        PaymentNr ->
-            case set_payment_status(PaymentNr, Status, order_datetime(Resource), Resource, Context) of
-                {ok, {_PaymentNr, _Status}} -> ok;
+%% @doc Fetch the original capture, never interpret a refund amount as a payment.
+%% Use only our configured API origin, not a URL supplied in a webhook.
+-spec receive_capture(CaptureId, Context) -> Result
+    when CaptureId :: binary() | undefined, Context :: z:context(),
+         Result :: ok | {error, term()}.
+receive_capture(CaptureId, Context) ->
+    case is_valid_order_id(CaptureId) of
+        true ->
+            Path = "/v2/payments/captures/" ++ binary_to_list(CaptureId),
+            case api_call(get, Path, [], Context) of
+                {ok, Capture} ->
+                    case capture_order_id(Capture) of
+                        undefined -> receive_webhook_payment(Capture, Context);
+                        OrderId -> receive_capture_order(OrderId, Capture, Context)
+                    end;
                 {error, _} = Error -> Error
-            end
+            end;
+        false -> {error, capture_id}
     end.
 
-sync_capture_completed(Resource, Context) ->
-    case capture_order_id(Resource) of
-        undefined ->
-            sync_capture_status(Resource, paid, Context);
-        OrderId ->
-            sync_webhook_order(#{ <<"id">> => OrderId }, Context)
+%% A capture event can arrive before the order's embedded captures catch up.
+%% For the single-unit/single-capture orders we create, use the fetched capture
+%% status and timestamp while retaining the order identity and original amount.
+receive_capture_order(OrderId, Capture, Context) ->
+    case fetch_order(OrderId, Context) of
+        {ok, #{ <<"purchase_units">> := [Unit] } = Order} ->
+            Captures = maps:get(<<"captures">>, maps:get(<<"payments">>, Unit, #{}), []),
+            case Captures of
+                [] -> receive_single_capture_order(Order, Capture, Context);
+                [#{ <<"id">> := Id }] ->
+                    case Id =:= maps:get(<<"id">>, Capture) of
+                        true -> receive_single_capture_order(Order, Capture, Context);
+                        false -> {error, capture_mismatch}
+                    end;
+                _ -> receive_webhook_payment(Order, Context)
+            end;
+        {ok, Order} -> receive_webhook_payment(Order, Context);
+        {error, _} = Error -> Error
     end.
+
+receive_single_capture_order(#{ <<"purchase_units">> := [Unit] } = Order, Capture, Context) ->
+    Updated = Order#{
+        <<"status">> => <<"COMPLETED">>,
+        <<"update_time">> => order_datetime(Capture),
+        <<"purchase_units">> => [Unit#{ <<"payments">> => #{ <<"captures">> => [Capture] } }]
+    },
+    receive_webhook_payment(Updated, Context).
+
+receive_webhook_payment(Resource, Context) ->
+    case webhook_payment(Resource) of
+        {ok, Data} ->
+            EventData = Data#{event_id => z_context:get(payment_event_id, Context)},
+            case mod_payment:receive_payment(mod_payment_paypal, EventData, Context) of
+                {ok, _} -> ok;
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error -> Error
+    end.
+
+%% @doc Normalize an order or standalone capture retrieved from PayPal.
+%% Orders remain the canonical identity for captures belonging to an order.
+-spec webhook_payment(Resource) -> Result
+    when Resource :: map(), Result :: {ok, map()} | {error, term()}.
+webhook_payment(#{ <<"id">> := Id, <<"purchase_units">> := Units } = Order) ->
+    case {order_payment_status(Order), order_amount(Units)} of
+        {{ok, Status}, {ok, Amount, Currency}} ->
+            {ok, #{psp_external_id => Id, payment_nr => payment_nr(Order),
+                   amount => Amount, currency => Currency, status => Status,
+                   status_date => order_datetime(Order), psp_data => Order,
+                   contact => payment_link_contact(Order)}};
+        {{error, _} = Error, _} -> Error;
+        {_, {error, _} = Error} -> Error
+    end;
+webhook_payment(#{ <<"id">> := Id, <<"amount">> := Amount } = Capture) ->
+    SyntheticOrder = #{ <<"purchase_units">> => [#{ <<"payments">> => #{ <<"captures">> => [Capture] } }] },
+    case {capture_payment_status(SyntheticOrder), order_amount([#{ <<"amount">> => Amount }])} of
+        {{ok, Status}, {ok, Value, Currency}} ->
+            {ok, #{psp_external_id => <<"capture:", Id/binary>>,
+                   payment_nr => capture_payment_nr(Capture),
+                   amount => Value, currency => Currency, status => Status,
+                   status_date => order_datetime(Capture), psp_data => Capture}};
+        {{error, _} = Error, _} -> Error;
+        {_, {error, _} = Error} -> Error
+    end;
+webhook_payment(_) -> {error, payment_data}.
+
+order_amount([#{ <<"amount">> := #{ <<"currency_code">> := Currency }} | _] = Units) ->
+    try
+        Values = [begin
+            #{ <<"amount">> := #{ <<"currency_code">> := Currency, <<"value">> := Value }} = Unit,
+            z_convert:to_float(Value)
+        end || Unit <- Units],
+        {ok, lists:sum(Values), Currency}
+    catch
+        _:_ -> {error, amount}
+    end;
+order_amount(_) -> {error, amount}.
+
+-spec refund_capture_id(Resource) -> binary() | undefined
+    when Resource :: map().
+refund_capture_id(Resource) ->
+    Links = maps:get(<<"links">>, Resource, []),
+    Ids = [Id || #{ <<"rel">> := <<"up">>, <<"href">> := Href } <- Links,
+                 Id <- [capture_id_from_url(Href)], Id =/= undefined],
+    case Ids of [Id | _] -> Id; [] -> undefined end.
+
+capture_id_from_url(Url) when is_binary(Url) ->
+    case uri_string:parse(Url) of
+        #{path := <<"/v2/payments/captures/", Id/binary>>} ->
+            case is_valid_order_id(Id) of true -> Id; false -> undefined end;
+        _ -> undefined
+    end;
+capture_id_from_url(_) -> undefined.
 
 capture_payment_nr(#{ <<"custom_id">> := PaymentNr }) ->
     PaymentNr;
